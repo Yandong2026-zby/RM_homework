@@ -2,100 +2,158 @@
 #include <vector>
 #include <opencv2/opencv.hpp>
 
-#define USE_CAMERA 0  
-
-using namespace std;
 using namespace cv;
+using namespace std;
 
-Mat getImageFromLocal()
+// 灯条结构体
+struct Bar
 {
-    Mat src = imread("test.jpg");
-    if(src.empty())
-    {
-        cout << "找不到 test.jpg！图片放错文件夹了！" << endl;
-    }
-    return src;
-}
+    Rect rect;
+};
 
 int main()
 {
-    Mat frame = getImageFromLocal();
+    // 读取图片，把图片放到build文件夹内，命名armor3.jpg
+    Mat frame = imread("armor3.jpg");
     if(frame.empty())
     {
+        cout << "图片读取失败！检查路径" << endl;
         return -1;
     }
 
-    Mat hsv;
+    Mat hsv, mask;
+    // HSV红色灯条阈值
     cvtColor(frame, hsv, COLOR_BGR2HSV);
+    inRange(hsv, Scalar(0, 80, 80), Scalar(15, 255, 255), mask);
 
-    
-    Scalar lower_red = Scalar(0,80,40);
-    Scalar upper_red = Scalar(15, 255,255);
-    Mat mask;
-    inRange(hsv, lower_red, upper_red, mask);
-
-    
-    Mat kernel = getStructuringElement(MORPH_RECT, Size(3,3));
-    morphologyEx(mask, mask, MORPH_OPEN, kernel);
-
+    // 轮廓查找，筛选灯条
     vector<vector<Point>> contours;
-    vector<Vec4i> hierarchy;
-    findContours(mask, contours, hierarchy, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+    findContours(mask, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
 
-    vector<Point2f> armor;
-
-    for(auto &c : contours)
+    vector<Bar> bars;
+    for(auto &cont : contours)
     {
-        
-        if(contourArea(c) < 2000) continue;
+        Rect r = boundingRect(cont);
 
-        vector<Point> approx;
-        approxPolyDP(c, approx, arcLength(c, true)*0.04, true);
+        if(r.width < 5 || r.height < 10)
+            continue;
 
-        if(approx.size() == 4)
+        float wh_ratio = (float)r.width / r.height;
+        if(wh_ratio > 0.05 && wh_ratio < 0.8)
         {
-            for(auto p : approx)
-                armor.push_back(Point2f(p.x, p.y));
-            break;
+            Bar b;
+            b.rect = r;
+            bars.push_back(b);
+            rectangle(frame, r, Scalar(255, 0, 0), 2);
         }
     }
 
-    if(armor.size() != 4)
+    // =====================【变量声明】=====================
+    vector<Point2f> armor_points;
+    Point2f lu, ru, rd, ld;
+    bool find_armor = false;
+    // ======================================================
+
+    // 两层for循环配对左右灯条
+    for(int i = 0; i < bars.size(); i++)
     {
-        cout << "没找到装甲板！HSV颜色阈值不合适，需要调整！" << endl;
-        imshow("mask",mask);
+        for(int j = 0; j < bars.size(); j++)
+        {
+            if(i == j) continue;
+
+            Bar &bar1 = bars[i];
+            Bar &bar2 = bars[j];
+
+            float h_diff = fabs(bar1.rect.height - bar2.rect.height);
+            float y_diff = fabs(bar1.rect.y - bar2.rect.y);
+            float dx = fabs(bar1.rect.x - bar2.rect.x);
+
+            if(h_diff < 50 && y_diff < 35 && dx > 30 && dx < 300)
+            {
+                Bar bar_left  = bar1.rect.x < bar2.rect.x ? bar1 : bar2;
+                Bar bar_right = bar1.rect.x < bar2.rect.x ? bar2 : bar1;
+
+                // 左右灯条中心点
+                float left_cx = bar_left.rect.x + bar_left.rect.width / 2.0f;
+                float left_cy = bar_left.rect.y + bar_left.rect.height / 2.0f;
+                float right_cx = bar_right.rect.x + bar_right.rect.width / 2.0f;
+                float right_cy = bar_right.rect.y + bar_right.rect.height / 2.0f;
+
+                // 装甲板半高，固定像素值，根据图片调整
+                float armor_half = 45;
+
+                // 计算灯条连线的垂直方向
+                float dx_seg = right_cx - left_cx;
+                float dy_seg = right_cy - left_cy;
+                // 垂直向量归一化
+                float len = sqrt(dx_seg*dx_seg + dy_seg*dy_seg);
+                float nx = -dy_seg / len;
+                float ny = dx_seg / len;
+
+                lu = Point2f(left_cx + nx * armor_half, left_cy + ny * armor_half);
+                ld = Point2f(left_cx - nx * armor_half, left_cy - ny * armor_half);
+                ru = Point2f(right_cx + nx * armor_half, right_cy + ny * armor_half);
+                rd = Point2f(right_cx - nx * armor_half, right_cy - ny * armor_half);
+
+                armor_points.clear();
+                armor_points.push_back(lu);
+                armor_points.push_back(ru);
+                armor_points.push_back(rd);
+                armor_points.push_back(ld);
+
+                find_armor = true;
+                cout << "✅配对成功！" << endl;
+                cout << "lu:"<<lu.x<<","<<lu.y<<" ru:"<<ru.x<<","<<ru.y<<endl;
+                cout << "rd:"<<rd.x<<","<<rd.y<<" ld:"<<ld.x<<","<<ld.y<<endl;
+                break;
+            }
+        }
+        if(find_armor) break;
+    }
+
+    if(!find_armor || armor_points.size() != 4)
+    {
+        cout << "❌没有找到装甲板！HSV颜色阈值不合适，需要调整！" << endl;
+        imshow("mask", mask);
         waitKey(0);
         return -1;
     }
-    vector<Point3f> world = {
-        Point3f(-63.25, -68.5, 0),
-        Point3f( 63.25, -68.5, 0),
-        Point3f( 63.25,  68.5, 0),
-        Point3f(-63.25,  68.5, 0)
+
+    // ======================绘图代码======================
+    circle(frame, lu, 5, Scalar(0, 255, 0), -1);
+    circle(frame, ru, 5, Scalar(0, 255, 0), -1);
+    circle(frame, rd, 5, Scalar(0, 255, 0), -1);
+    circle(frame, ld, 5, Scalar(0, 255, 0), -1);
+
+    line(frame, lu, ru, Scalar(0, 255, 0), 3);
+    line(frame, ru, rd, Scalar(0, 255, 0), 3);
+    line(frame, rd, ld, Scalar(0, 255, 0), 3);
+    line(frame, ld, lu, Scalar(0, 255, 0), 3);
+
+    putText(frame, "ARMOR", lu, FONT_HERSHEY_SIMPLEX,0.7,Scalar(0,255,0),2);
+    // ====================================================
+
+    // ----------------solvePnP部分----------------
+    vector<Point3f> world_points = {
+        Point3f(-65, -25, 0),
+        Point3f( 65, -25, 0),
+        Point3f( 65,  25, 0),
+        Point3f(-65,  25, 0)
     };
-    
+    Mat camera_matrix = (Mat_<double>(3,3) <<
+        1200, 0, 320,
+        0, 1200, 240,
+        0,0,1
+    );
+    Mat dist_coeffs = Mat::zeros(5,1,CV_64F);
+    Mat rvec, tvec;
+    solvePnP(world_points, armor_points, camera_matrix, dist_coeffs, rvec, tvec);
 
-    
-    Mat cam = (Mat_<double>(3,3) << 800,0,320, 0,800,240, 0,0,1);
-    Mat dist = Mat::zeros(5,1,CV_64F);
+    cout << "平移向量tvec:" << tvec << endl;
+    cout << "旋转向量rvec:" << rvec << endl;
 
-    Mat rvec,tvec;
-
-    solvePnP(world, armor, cam, dist, rvec, tvec);
-    drawFrameAxes(frame, cam, dist, rvec, tvec, 50);
-
-  
-    for(auto p : armor) circle(frame,p,5,Scalar(0,255,0),2);
-
-  
-    cout << "=====作业PnP输出结果=====" << endl;
-    cout << "平移向量XYZ(单位mm)：" << tvec << endl;
-    cout << "旋转向量（姿态角度）：" << rvec << endl;
-
-    imshow("最终作业效果",frame);
-    imshow("颜色筛选蒙版mask",mask);
-
+    imshow("result", frame);
+    imshow("mask", mask);
     waitKey(0);
-    destroyAllWindows();
     return 0;
 }
