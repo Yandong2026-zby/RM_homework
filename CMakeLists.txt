@@ -11,8 +11,16 @@ link_directories(/opt/MVS/lib/64)
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 
-# 指定：用main.cpp生成名叫main的可执行程序
+# main: 离线图片上的装甲板识别 + PnP 调试
 add_executable(main main.cpp)
-
-# 链接海康相机库 + OpenCV库
 target_link_libraries(main MvCameraControl ${OpenCV_LIBS})
+
+# grab: 接工业相机实时取流，用于标定和后续在线识别
+add_executable(grab camera_grab.cpp)
+target_link_libraries(grab MvCameraControl ${OpenCV_LIBS})
+
+# capture: 实时识别装甲板并拍图，攒标定/训练用的数据集
+add_executable(capture capture_armor.cpp)
+target_link_libraries(capture MvCameraControl ${OpenCV_LIBS})
+add_executable(calibration calibration.cpp)
+target_link_libraries(calibration ${OpenCV_LIBS})
