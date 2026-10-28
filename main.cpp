@@ -1,5 +1,6 @@
 #include <iostream>
 #include <vector>
+#include <filesystem>
 #include <opencv2/opencv.hpp>
 #include <opencv2/calib3d.hpp>
 
@@ -12,10 +13,11 @@ struct Bar
     Rect rect;
 };
 
-int main()
+int main(int argc, char** argv)
 {
-    // 读取图片，把图片放到build文件夹内，命名armor3.jpg
-    Mat frame = imread("armor3.jpg");
+    // 读取图片：优先用命令行传入的路径，否则用默认的 armor3.jpg
+    const string imgPath = (argc > 1) ? argv[1] : "armor3.jpg";
+    Mat frame = imread(imgPath);
     if(frame.empty())
     {
         cout << "图片读取失败! 检查路径" << endl;
@@ -153,16 +155,40 @@ cout << "  [尝试配对] 高度差=" << h_diff << " Y轴差=" << y_diff << " X�
         Point3f(-65, 25, 0)
     };
  
-    //自动计算图片中心点坐标
-    double cx = frame.cols / 2.0;
-    double cy = frame.rows / 2.0;
-    
-    Mat camera_matrix = (Mat_<double>(3,3) <<
-        1500, 0, cx,
-        0, 1500, cy,
-        0, 0, 1
-    );
-    Mat dist_coeffs = Mat::zeros(5,1,CV_64F);
+    // ========= 加载标定结果，不再写死内参 =========
+    Mat camera_matrix, dist_coeffs;
+    const string paramPath = "camera_param.yaml";
+    FileStorage fs;
+    if (filesystem::exists(paramPath) &&
+        fs.open(paramPath, FileStorage::READ) &&
+        !fs["cameraMatrix"].empty() && !fs["distCoeffs"].empty())
+    {
+        fs["cameraMatrix"] >> camera_matrix;
+        fs["distCoeffs"] >> dist_coeffs;
+
+        Size calibSize;
+        if (!fs["imageSize"].empty()) fs["imageSize"] >> calibSize;
+        fs.release();
+
+        cout << "已加载 " << paramPath << endl;
+        if (!calibSize.empty() && calibSize != frame.size())
+        {
+            cout << "⚠️ 当前图片尺寸 " << frame.size() << " 与标定尺寸 " << calibSize
+                 << " 不一致，PnP 距离会不准！" << endl;
+        }
+    }
+    else
+    {
+        // 没有标定文件时退回经验值，保证旧流程还能跑
+        cout << "⚠️ 未找到 " << paramPath << "，使用默认内参（结果仅作演示）" << endl;
+        camera_matrix = (Mat_<double>(3,3) <<
+            1500, 0, frame.cols / 2.0,
+            0, 1500, frame.rows / 2.0,
+            0, 0, 1
+        );
+        dist_coeffs = Mat::zeros(5,1,CV_64F);
+    }
+
     Mat rvec, tvec;
     if(armor_points.size() == 4)
     {
