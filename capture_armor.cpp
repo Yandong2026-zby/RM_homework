@@ -16,8 +16,9 @@ using namespace cv;
 using namespace std;
 
 // ============================================================
-// 装甲板拍摄程序
+// 装甲板拍摄/识别程序
 //   ./capture [输出目录] [曝光us] [增益dB]
+//   ./capture --src 图片或视频路径     # 离线模式，不连接相机
 // 按键:
 //   s / 空格  立即保存一帧
 //   a         自动拍摄开关(识别到装甲板并稳定几帧后自动存)
@@ -270,6 +271,23 @@ bool PairArmor(const vector<Bar>& bars, const Size& imgSize,
 }
 
 // ================= 小工具 =================
+// ================= 位姿解算 =================
+// 小装甲板物理尺寸（mm）：灯条外缘间距 126.5，灯条长度 33
+static const vector<Point3f> kArmorWorld = {
+    {-63.25f, -16.5f, 0.f},   // 左上
+    { 63.25f, -16.5f, 0.f},   // 右上
+    { 63.25f,  16.5f, 0.f},   // 右下
+    {-63.25f,  16.5f, 0.f},   // 左下
+};
+
+// corners 顺序必须与 kArmorWorld 一一对应，否则坐标轴会乱转
+bool SolveArmorPose(const vector<Point2f>& corners, const Mat& K, const Mat& D,
+                    Mat& rvec, Mat& tvec)
+{
+    if (corners.size() != 4) return false;
+    // IPPE 专门解 4 个共面点的位姿，比默认迭代法更稳
+    return solvePnP(kArmorWorld, corners, K, D, rvec, tvec, false, SOLVEPNP_IPPE);
+}
 string NowStamp()
 {
     const auto now = chrono::system_clock::now();
@@ -301,24 +319,81 @@ int main(int argc, char** argv)
     string outDir = "dataset";
     double exposure_us = 5000.0;
     double gain_db = 0.0;
-    if (argc > 1) outDir = argv[1];
-    if (argc > 2) exposure_us = atof(argv[2]);
-    if (argc > 3) gain_db = atof(argv[3]);
+    string srcPath;                 // --src 指定后走离线图片/视频，不连相机
+
+    // 位置参数保持兼容：./capture [输出目录] [曝光us] [增益dB]
+    vector<string> posArgs;
+    for (int i = 1; i < argc; ++i)
+    {
+        if (string(argv[i]) == "--src" && i + 1 < argc)
+            srcPath = argv[++i];
+        else
+            posArgs.push_back(argv[i]);
+    }
+    if (posArgs.size() > 0) outDir = posArgs[0];
+    if (posArgs.size() > 1) exposure_us = atof(posArgs[1].c_str());
+    if (posArgs.size() > 2) gain_db = atof(posArgs[2].c_str());
 
     std::filesystem::create_directories(outDir + "/full");
     std::filesystem::create_directories(outDir + "/armor");
 
     HikCamera cam;
-    if (!cam.Open(0, exposure_us, gain_db))
+    VideoCapture fileCap;
+    Mat staticFrame;
+    const bool useFile = !srcPath.empty();
+    bool isImage = false;
+
+    if (useFile)
+    {
+        // 先按图片读，读不到再按视频打开
+        staticFrame = imread(srcPath);
+        if (!staticFrame.empty())
+        {
+            isImage = true;
+            printf("离线模式(图片): %s  %dx%d\n",
+                   srcPath.c_str(), staticFrame.cols, staticFrame.rows);
+        }
+        else if (fileCap.open(srcPath) && fileCap.isOpened())
+        {
+            printf("离线模式(视频): %s  %.0fx%.0f  %.1ffps\n", srcPath.c_str(),
+                   fileCap.get(CAP_PROP_FRAME_WIDTH),
+                   fileCap.get(CAP_PROP_FRAME_HEIGHT),
+                   fileCap.get(CAP_PROP_FPS));
+        }
+        else
+        {
+            printf("无法打开 %s\n", srcPath.c_str());
+            return -1;
+        }
+    }
+    else if (!cam.Open(0, exposure_us, gain_db))
     {
         cam.Close();
         return -1;
+    }
+     // ---------- 加载标定内参 ----------
+    Mat K, D;
+    bool haveCalib = false;
+    {
+        FileStorage fs("camera_param.yaml", FileStorage::READ);
+        if (fs.isOpened() && !fs["cameraMatrix"].empty() && !fs["distCoeffs"].empty())
+        {
+            fs["cameraMatrix"] >> K;
+            fs["distCoeffs"] >> D;
+            haveCalib = true;
+            printf("已加载 camera_param.yaml\n");
+        }
+        else
+        {
+            printf("警告: 没找到 camera_param.yaml，只检测不做位姿（请在项目根目录运行）\n");
+        }
     }
 
     namedWindow("armor capture", WINDOW_NORMAL);
     resizeWindow("armor capture", 1280, 960);
 
     bool showMask = false;
+    bool maskWinShown = false;
     bool autoShot = false;
     int stableCount = 0;
     int saved = 0;
@@ -330,10 +405,31 @@ int main(int argc, char** argv)
     Mat frame, mask, display;
     auto tPrev = chrono::steady_clock::now();
     double fps = 0;
+    int pnpLogCount = 0;   // 每 30 帧往终端打一次位姿，方便没 GUI 时调试
+
+    // 离线视频按原帧率播放，图片每帧停 30ms，相机用 1ms
+    int keyDelayMs = 1;
+    if (useFile)
+    {
+        const double fileFps = isImage ? 0 : fileCap.get(CAP_PROP_FPS);
+        keyDelayMs = (fileFps > 1.0) ? (int)(1000.0 / fileFps) : 30;
+    }
 
     while (true)
     {
-        if (!cam.Grab(frame) || frame.empty())
+        if (useFile)
+        {
+            if (isImage)
+            {
+                staticFrame.copyTo(frame);
+            }
+            else if (!fileCap.read(frame) || frame.empty())
+            {
+                printf("视频播放结束\n");
+                break;
+            }
+        }
+        else if (!cam.Grab(frame) || frame.empty())
         {
             continue;
         }
@@ -344,6 +440,11 @@ int main(int argc, char** argv)
         Bar L, R;
         vector<Point2f> corners;
         const bool hasArmor = PairArmor(bars, frame.size(), L, R, corners);
+         // ---------- 位姿解算 ----------
+        Mat rvec, tvec;
+        bool pnpOk = false;
+        if (hasArmor && haveCalib)
+            pnpOk = SolveArmorPose(corners, K, D, rvec, tvec);
 
         // ---------- 计时 ----------
         const auto tNow = chrono::steady_clock::now();
@@ -359,9 +460,32 @@ int main(int argc, char** argv)
         Mat crop;
         if (hasArmor)
         {
-            polylines(display, corners, true, Scalar(0, 255, 0), 2);
+            // polylines 只收 CV_32S 整数点，Point2f 要先转 Point
+            vector<Point> poly;
+            poly.reserve(corners.size());
+            for (const auto& p : corners)
+                poly.emplace_back(cvRound(p.x), cvRound(p.y));
+            polylines(display, poly, true, Scalar(0, 255, 0), 2);
             for (const auto& p : corners)
                 circle(display, p, 4, Scalar(0, 255, 0), -1);
+              if (pnpOk)
+            {
+                // 轴长 50mm，tvec 也是 mm，单位必须一致
+                drawFrameAxes(display, K, D, rvec, tvec, 50.0f);
+
+                if (++pnpLogCount % 30 == 0)
+                    printf("t = (%.1f, %.1f, %.1f) mm\n",
+                           tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2));
+
+                // tvec 单位是 mm，除以 1000 显示成米
+                putText(display,
+                        format("t: %.3f %.3f %.3f m",
+                               tvec.at<double>(0) / 1000.0,
+                               tvec.at<double>(1) / 1000.0,
+                               tvec.at<double>(2) / 1000.0),
+                        Point(20, 150), FONT_HERSHEY_SIMPLEX, 0.7,
+                        Scalar(0, 255, 255), 2);
+            }  
 
             // 裁装甲板区域，四周留 20% 边距
             Rect box = boundingRect(corners);
@@ -409,18 +533,27 @@ int main(int argc, char** argv)
                 hasArmor ? Scalar(0, 255, 0) : Scalar(0, 0, 255), 2);
         putText(display, format("fps %.1f  bars %zu  saved %d", fps, bars.size(), saved),
                 Point(20, 80), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 255, 255), 2);
-        putText(display, format("exposure %.0f us  auto:%s", cam.GetExposure(),
-                                autoShot ? "ON" : "OFF"),
-                Point(20, 115), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 255, 255), 2);
+        if (!useFile)
+            putText(display, format("exposure %.0f us  auto:%s", cam.GetExposure(),
+                                    autoShot ? "ON" : "OFF"),
+                    Point(20, 115), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 255, 255), 2);
 
         imshow("armor capture", display);
-        if (showMask) imshow("mask", mask);
-        else destroyWindow("mask");
+        if (showMask)
+        {
+            imshow("mask", mask);
+            maskWinShown = true;
+        }
+        else if (maskWinShown)
+        {
+            destroyWindow("mask");   // 只在窗口真的存在时销毁
+            maskWinShown = false;
+        }
 
         if (wantSave) SaveOnce(tag);
 
         // ---------- 按键 ----------
-        const int key = waitKey(1) & 0xFF;
+        const int key = waitKey(keyDelayMs) & 0xFF;
         if (key == 'q' || key == 27) break;
         if (key == 's' || key == ' ') SaveOnce("manual");
         if (key == 'a')
@@ -429,7 +562,7 @@ int main(int argc, char** argv)
             printf("自动拍摄: %s\n", autoShot ? "开" : "关");
         }
         if (key == 'm') showMask = !showMask;
-        if (key == '[' || key == ']')
+        if (!useFile && (key == '[' || key == ']'))
         {
             const double cur = cam.GetExposure();
             const double next = (key == '[') ? cur / 1.2 : cur * 1.2;
@@ -437,7 +570,7 @@ int main(int argc, char** argv)
         }
     }
 
-    cam.Close();
+    if (!useFile) cam.Close();
     destroyAllWindows();
     printf("共保存 %d 组图片到 %s/\n", saved, outDir.c_str());
     return 0;
