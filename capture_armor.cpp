@@ -97,6 +97,10 @@ public:
         MV_CC_SetEnumValue(handle_, "GainAuto", MV_GAIN_MODE_OFF);
         MV_CC_SetFloatValue(handle_, "Gain", gain_db);
 
+        // 固定采集帧率：dt 稳定，Kalman 速度估计才稳定
+        MV_CC_SetBoolValue(handle_, "AcquisitionFrameRateEnable", true);
+        MV_CC_SetFloatValue(handle_, "AcquisitionFrameRate", 25.0);
+
         PrintCurrentExposure();
 
         if (MV_CC_StartGrabbing(handle_) != MV_OK)
@@ -481,10 +485,15 @@ int main(int argc, char** argv)
             else if (predicting)
                 printf("pred t = (%.1f, %.1f, %.1f) mm\n", predT[0], predT[1], predT[2]);
         }
-        // 跟踪状态变化时打一条日志
+        // 跟踪状态变化时打一条日志，带上当时的预测/测量值
         if (predicting != wasPredicting)
         {
-            printf("%s\n", predicting ? ">>> 目标丢失，开始预测" : ">>> 目标重新捕获");
+            if (predicting)
+                printf(">>> 目标丢失，开始预测 pred = (%.1f, %.1f, %.1f) mm\n",
+                       predT[0], predT[1], predT[2]);
+            else
+                printf(">>> 目标重新捕获 meas = (%.1f, %.1f, %.1f) mm\n",
+                       measT[0], measT[1], measT[2]);
             wasPredicting = predicting;
         }
         // ---------- 画图 ----------
