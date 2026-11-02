@@ -11,6 +11,7 @@
 
 #include <opencv2/opencv.hpp>
 #include "MvCameraControl.h"
+#include "pose_tracker.hpp"
 
 using namespace cv;
 using namespace std;
@@ -406,6 +407,8 @@ int main(int argc, char** argv)
     auto tPrev = chrono::steady_clock::now();
     double fps = 0;
     int pnpLogCount = 0;   // 每 30 帧往终端打一次位姿，方便没 GUI 时调试
+    bool wasPredicting = false;
+    PoseTracker tracker;
 
     // 离线视频按原帧率播放，图片每帧停 30ms，相机用 1ms
     int keyDelayMs = 1;
@@ -439,12 +442,7 @@ int main(int argc, char** argv)
 
         Bar L, R;
         vector<Point2f> corners;
-        const bool hasArmor = PairArmor(bars, frame.size(), L, R, corners);
-         // ---------- 位姿解算 ----------
-        Mat rvec, tvec;
-        bool pnpOk = false;
-        if (hasArmor && haveCalib)
-            pnpOk = SolveArmorPose(corners, K, D, rvec, tvec);
+       const bool hasArmor = PairArmor(bars, frame.size(), L, R, corners);
 
         // ---------- 计时 ----------
         const auto tNow = chrono::steady_clock::now();
@@ -452,6 +450,43 @@ int main(int argc, char** argv)
         if (dt > 0) fps = 0.9 * fps + 0.1 * (1.0 / dt);
         tPrev = tNow;
 
+        // ---------- 位姿解算 ----------
+        Mat rvec, tvec;
+        bool pnpOk = false;
+        if (hasArmor && haveCalib)
+            pnpOk = SolveArmorPose(corners, K, D, rvec, tvec);
+
+        // ---------- Kalman 跟踪 / 预测 ----------
+        Vec3d measT, measR, predT, predR;
+        bool hasPred = false;
+        bool predicting = false;    // 本帧没检测到，靠预测续着
+        if (pnpOk)
+        {
+            measT = Vec3d(tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2));
+            measR = Vec3d(rvec.at<double>(0), rvec.at<double>(1), rvec.at<double>(2));
+            tracker.update(measT, measR, dt, predT, predR);
+            hasPred = true;
+        }
+        else if (tracker.ready())
+        {
+            hasPred = tracker.predictOnly(dt, predT, predR);
+            if (!hasPred) tracker.reset();   // 跟丢太久，等重新捕获
+            predicting = hasPred;
+        }
+
+        if (++pnpLogCount % 30 == 0)
+        {
+            if (pnpOk)
+                printf("meas t = (%.1f, %.1f, %.1f) mm\n", measT[0], measT[1], measT[2]);
+            else if (predicting)
+                printf("pred t = (%.1f, %.1f, %.1f) mm\n", predT[0], predT[1], predT[2]);
+        }
+        // 跟踪状态变化时打一条日志
+        if (predicting != wasPredicting)
+        {
+            printf("%s\n", predicting ? ">>> 目标丢失，开始预测" : ">>> 目标重新捕获");
+            wasPredicting = predicting;
+        }
         // ---------- 画图 ----------
         frame.copyTo(display);
         for (const auto& b : bars)
@@ -468,24 +503,7 @@ int main(int argc, char** argv)
             polylines(display, poly, true, Scalar(0, 255, 0), 2);
             for (const auto& p : corners)
                 circle(display, p, 4, Scalar(0, 255, 0), -1);
-              if (pnpOk)
-            {
-                // 轴长 50mm，tvec 也是 mm，单位必须一致
-                drawFrameAxes(display, K, D, rvec, tvec, 50.0f);
-
-                if (++pnpLogCount % 30 == 0)
-                    printf("t = (%.1f, %.1f, %.1f) mm\n",
-                           tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2));
-
-                // tvec 单位是 mm，除以 1000 显示成米
-                putText(display,
-                        format("t: %.3f %.3f %.3f m",
-                               tvec.at<double>(0) / 1000.0,
-                               tvec.at<double>(1) / 1000.0,
-                               tvec.at<double>(2) / 1000.0),
-                        Point(20, 150), FONT_HERSHEY_SIMPLEX, 0.7,
-                        Scalar(0, 255, 255), 2);
-            }  
+              
 
             // 裁装甲板区域，四周留 20% 边距
             Rect box = boundingRect(corners);
@@ -501,6 +519,26 @@ int main(int argc, char** argv)
         else
         {
             stableCount = 0;
+        }
+// ---------- 实测位姿：红绿蓝轴 ----------
+        if (pnpOk)
+        {
+            drawFrameAxes(display, K, D, rvec, tvec, 50.0f);
+            putText(display,
+                    format("meas t=(%.2f, %.2f, %.2f) m",
+                           measT[0] / 1000.0, measT[1] / 1000.0, measT[2] / 1000.0),
+                    Point(20, 150), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
+        }
+
+        // ---------- 预测位姿：黄色轴 ----------
+        if (hasPred)
+        {
+            const Scalar predColor(0, 255, 255);
+            DrawPoseAxes(display, K, D, predR, predT, 50.0, predColor);
+            putText(display,
+                    format("pred t=(%.2f, %.2f, %.2f) m",
+                           predT[0] / 1000.0, predT[1] / 1000.0, predT[2] / 1000.0),
+                    Point(20, 180), FONT_HERSHEY_SIMPLEX, 0.6, predColor, 2);
         }
 
         // ---------- 保存 ----------
@@ -528,9 +566,11 @@ int main(int argc, char** argv)
         }
 
         // ---------- HUD ----------
-        const string status = hasArmor ? "ARMOR OK" : "no armor";
-        putText(display, status, Point(20, 40), FONT_HERSHEY_SIMPLEX, 1.0,
-                hasArmor ? Scalar(0, 255, 0) : Scalar(0, 0, 255), 2);
+        string status = "no armor";
+        Scalar statusColor(0, 0, 255);
+        if (predicting)      { status = "PREDICT";  statusColor = Scalar(0, 255, 255); }
+        else if (hasArmor)   { status = "ARMOR OK"; statusColor = Scalar(0, 255, 0); }
+        putText(display, status, Point(20, 40), FONT_HERSHEY_SIMPLEX, 1.0, statusColor, 2);
         putText(display, format("fps %.1f  bars %zu  saved %d", fps, bars.size(), saved),
                 Point(20, 80), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 255, 255), 2);
         if (!useFile)
