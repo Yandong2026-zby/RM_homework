@@ -544,11 +544,26 @@ int main(int argc, char** argv)
         {
             const Scalar predColor(0, 255, 255);
             DrawPoseAxes(display, K, D, predR, predT, 50.0, predColor);
+
+            // 预测的装甲板轮廓，丢失时比三根轴更直观
+            vector<Point2f> proj;
+            projectPoints(kArmorWorld, predR, predT, K, D, proj);
+            vector<Point> projI;
+            projI.reserve(proj.size());
+            for (const auto& p : proj)
+                projI.emplace_back(cvRound(p.x), cvRound(p.y));
+            polylines(display, projI, true, predColor, 2);
+
             putText(display,
                     format("pred t=(%.2f, %.2f, %.2f) m",
                            predT[0] / 1000.0, predT[1] / 1000.0, predT[2] / 1000.0),
                     Point(20, 180), FONT_HERSHEY_SIMPLEX, 0.6, predColor, 2);
         }
+
+        // ---------- 图例 ----------
+        putText(display, "RGB axes / green quad = measured    yellow = Kalman prediction",
+                Point(20, display.rows - 20), FONT_HERSHEY_SIMPLEX, 0.6,
+                Scalar(200, 200, 200), 1, LINE_AA);
 
         // ---------- 保存 ----------
         auto SaveOnce = [&](const string& tag) {
